@@ -1,4 +1,25 @@
 This project was entirely coded by Claude Opus 4.6
+The tutorial was designed to work with 32GB of RAM and a Rx 9070.
+Fully automated, idempotent, reboot-resilient installer for:
+#    - AMD ROCm 7.2  (driver + stack)
+#    - PyTorch 2.9.1 + ROCm 7.2  (official AMD wheels from repo.radeon.com)
+#    - ComfyUI       (official upstream)
+#    - SDXL Turbo checkpoint (Stability AI, Hugging Face)
+#
+#  Target: Ubuntu 24.04 LTS, AMD RX 9070 (16 GB VRAM, gfx1201 / RDNA 4)
+#  Must run as root (sudo).
+
+Sources:
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-radeon.html
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedrad/linux/comfyui/installcomfyui.html
+#    https://repo.radeon.com/amdgpu-install/7.2/ubuntu/noble/
+#    https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
+#    https://github.com/comfyanonymous/ComfyUI
+#    https://huggingface.co/stabilityai/sdxl-turbo
+
+
 tutorial prompt:"Tu es un expert Linux + AMD ROCm + IA générative locale.
 Ton objectif est de produire un tutoriel COMPLET, extrêmement précis et strictement reproductible, destiné à un utilisateur intermédiaire, pour installer un logiciel de génération d’images et de vidéos par IA en local, compatible AMD ROCm, sur un PC Ubuntu totalement vierge.
 🖥️ CONFIGURATION MATÉRIELLE (IMMUTABLE)
