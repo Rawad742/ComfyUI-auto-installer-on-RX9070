@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+###############################################################################
+#  install-rocm-comfyui.sh
+#
+#  Fully automated, idempotent, reboot-resilient installer for:
+#    - AMD ROCm 7.2  (driver + stack)
+#    - PyTorch 2.9.1 + ROCm 7.2  (official AMD wheels from repo.radeon.com)
+#    - ComfyUI       (official upstream)
+#    - SDXL Turbo checkpoint (Stability AI, Hugging Face)
+#
+#  Target: Ubuntu 24.04 LTS, AMD RX 9070 (16 GB VRAM, gfx1201 / RDNA 4)
+#  Must run as root (sudo).
+#
+#  Sources:
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-radeon.html
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html
+#    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedrad/linux/comfyui/installcomfyui.html
+#    https://repo.radeon.com/amdgpu-install/7.2/ubuntu/noble/
+#    https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
+#    https://github.com/comfyanonymous/ComfyUI
+#    https://huggingface.co/stabilityai/sdxl-turbo
+###############################################################################
+set -euo pipefail
+# =============================================================================
+#  CONSTANTS
+# =============================================================================
+readonly SCRIPT_NAME="install-rocm-comfyui"
+readonly SCRIPT_PATH="$(readlink -f "$0")"
+readonly STATE_DIR="/var/lib/${SCRIPT_NAME}"
+readonly STATE_FILE="${STATE_DIR}/state"
+readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
+readonly LOCK_FILE="/run/${SCRIPT_NAME}.lock"
+readonly SERVICE_NAME="${SCRIPT_NAME}.service"
+readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+# Target user (the first non-root human user with UID >= 1000)
+readonly TARGET_USER="${SUDO_USER:-$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 ~ /bash|zsh|fish/ {print $1; exit}' /etc/passwd)}"
+readonly TARGET_HOME="$(eval echo ~"${TARGET_USER}")"
+readonly VENV_DIR="${TARGET_HOME}/comfyui-venv"
+readonly COMFYUI_DIR="${TARGET_HOME}/ComfyUI"
+readonly WHEEL_DIR="${TARGET_HOME}/.cache/rocm-wheels"
+# AMD ROCm 7.2 — Ubuntu 24.04 Noble
+readonly AMDGPU_DEB_URL="https://repo.radeon.com/amdgpu-install/7.2/ubuntu/noble/amdgpu-install_7.2.70200-1_all.deb"
+readonly AMDGPU_DEB_FILE="amdgpu-install_7.2.70200-1_all.deb"
+# PyTorch wheels — official AMD, ROCm 7.2, Python 3.12, Linux x86_64
+readonly WHEEL_BASE="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2"
+readonly TORCH_WHL="torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp312-cp312-linux_x86_64.whl"
+readonly TORCHVISION_WHL="torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp312-cp312-linux_x86_64.whl"
+readonly TORCHAUDIO_WHL="torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp312-cp312-linux_x86_64.whl"
+readonly TRITON_WHL="triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp312-cp312-linux_x86_64.whl"
+# Local filenames after download (URL-decoded)
+readonly TORCH_WHL_LOCAL="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp312-cp312-linux_x86_64.whl"
+readonly TORCHVISION_WHL_LOCAL="torchvision-0.24.0+rocm7.2.0.gitb919bd0c-cp312-cp312-linux_x86_64.whl"
+readonly TORCHAUDIO_WHL_LOCAL="torchaudio-2.9.0+rocm7.2.0.gite3c6ee2b-cp312-cp312-linux_x86_64.whl"
+readonly TRITON_WHL_LOCAL="triton-3.5.1+rocm7.2.0.gita272dfa8-cp312-cp312-linux_x86_64.whl"
+# SDXL Turbo model (Stability AI, Hugging Face)
+readonly MODEL_URL="https://huggingface.co/stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors"
+readonly MODEL_FILE="sd_xl_turbo_1.0_fp16.safetensors"
+# Maximum retries per critical command
+readonly MAX_RETRIES=2
+# Ordered list of installation steps
+readonly STEPS=(
+    "step_system_update"
+    "step_install_deps"
+    "step_install_amdgpu_installer"
+    "step_install_rocm"
+    "step_reboot_after_rocm"
+    "step_verify_rocm"
+    "step_create_venv"
+    "step_download_wheels"
+    "step_install_pytorch"
+    "step_verify_pytorch"
+    "step_clone_comfyui"
+    "step_install_comfyui_deps"
+    "step_download_model"
+    "step_create_launcher"
+    "step_final_verification"
+)
+# =============================================================================
+#  LOGGING
+# =============================================================================
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local msg="[${ts}] [${level}] $*"
+    echo "$msg" | tee -a "$LOG_FILE"
+}
+log_info()  { log "INFO"  "$@"; }
+log_warn()  { log "WARN"  "$@"; }
+log_error() { log "ERROR" "$@"; }
+log_step()  { log "STEP"  "========== $* =========="; }
+# =============================================================================
+#  STATE MANAGEMENT — persistent across reboots
+# =============================================================================
+state_init() {
+    mkdir -p "$STATE_DIR"
+    [[ -f "$STATE_FILE" ]] || echo "0" > "$STATE_FILE"
+}
+state_get() {
+    cat "$STATE_FILE" 2>/dev/null || echo "0"
+}
+state_set() {
+    echo "$1" > "$STATE_FILE"
+    sync
+    log_info "State persisted: step index $1"
+}
+# =============================================================================
+#  LOCK (prevent concurrent runs)
+# =============================================================================
+acquire_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local pid
+        pid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log_error "Another instance is running (PID $pid). Exiting."
+            exit 1
+        fi
+        log_warn "Stale lock file found (PID $pid not running). Removing."
+        rm -f "$LOCK_FILE"
+    fi
+    echo $$ > "$LOCK_FILE"
+}
+release_lock() {
+    rm -f "$LOCK_FILE"
+}
+# =============================================================================
+#  SYSTEMD BOOT SERVICE — auto-start after reboot
+# =============================================================================
+install_boot_service() {
+    if [[ -f "$SERVICE_FILE" ]]; then
+        log_info "Boot service already installed."
+        return 0
+    fi
+    log_info "Installing systemd boot service: ${SERVICE_NAME}"
+    cat > "$SERVICE_FILE" <<UNIT
+[Unit]
+Description=ROCm + ComfyUI automated installer (resume after reboot)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${SCRIPT_PATH}
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${SCRIPT_PATH}
+StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
+RemainAfterExit=no
+TimeoutStartSec=7200
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}"
+    log_info "Boot service enabled."
+}
+remove_boot_service() {
+    if [[ -f "$SERVICE_FILE" ]]; then
+        log_info "Removing boot service: ${SERVICE_NAME}"
+        systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+        rm -f "$SERVICE_FILE"
+        systemctl daemon-reload
+    fi
+}
+# =============================================================================
+#  RETRY WRAPPER — retries with error analysis
+# =============================================================================
+# run_cmd <description> <command...>
+# Runs a command with up to MAX_RETRIES retries. On each failure, logs the
+# error output and performs basic auto-correction (apt fix, dpkg configure).
+run_cmd() {
+    local desc="$1"; shift
+    local attempt=0
+    local rc=0
+    local err_file
+    err_file="$(mktemp)"
+    while (( attempt <= MAX_RETRIES )); do
+        (( attempt > 0 )) && log_warn "Retry ${attempt}/${MAX_RETRIES} for: ${desc}"
+        log_info "Running: ${desc}"
+        rc=0
+        "$@" 2>"$err_file" || rc=$?
+        if (( rc == 0 )); then
+            rm -f "$err_file"
+            return 0
+        fi
+        local err_msg
+        err_msg="$(cat "$err_file")"
+        log_error "Command failed (exit ${rc}): ${desc}"
+        log_error "stderr: ${err_msg}"
+        # Auto-correction heuristics
+        if echo "$err_msg" | grep -qi "dpkg was interrupted"; then
+            log_warn "Auto-fix: running dpkg --configure -a"
+            dpkg --configure -a 2>/dev/null || true
+        fi
+        if echo "$err_msg" | grep -qi "Unable to acquire the dpkg frontend lock\|Could not get lock"; then
+            log_warn "Auto-fix: waiting 30s for apt lock release"
+            sleep 30
+        fi
+        if echo "$err_msg" | grep -qi "unmet dependencies\|Broken packages"; then
+            log_warn "Auto-fix: running apt --fix-broken install"
+            apt-get --fix-broken install -y 2>/dev/null || true
+        fi
+        (( attempt++ ))
+    done
+    rm -f "$err_file"
+    log_error "FATAL: Command failed after all retries: ${desc}"
+    log_error "The installer will stop here. Check ${LOG_FILE} for details."
+    log_error "After fixing the issue, re-run: sudo bash ${SCRIPT_PATH}"
+    exit 1
+}
+# =============================================================================
+#  HELPER — run command as target user
+# =============================================================================
+as_user() {
+    sudo -H -u "$TARGET_USER" -- "$@"
+}
+# =============================================================================
+#  HELPER — schedule reboot and exit
+# =============================================================================
+do_reboot() {
+    log_info "System reboot required. Rebooting in 5 seconds..."
+    log_info "The installer will resume automatically after reboot."
+    sync
+    sleep 5
+    release_lock
+    /sbin/reboot
+    exit 0
+}
+# =============================================================================
+#  INSTALLATION STEPS — each is idempotent
+# =============================================================================
+# ---- 0: System update -------------------------------------------------------
+step_system_update() {
+    log_step "System update (apt update + upgrade)"
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    run_cmd "apt update" \
+        apt-get update -y
+    run_cmd "apt upgrade" \
+        apt-get upgrade -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"
+    log_info "System update complete."
+}
+# ---- 1: System dependencies --------------------------------------------------
+step_install_deps() {
+    log_step "Install system dependencies"
+    local pkgs=(
+        wget git curl build-essential
+        python3-pip python3-setuptools python3-wheel
+        python3.12-venv
+        "linux-headers-$(uname -r)"
+        "linux-modules-extra-$(uname -r)"
+        dkms
+    )
+    # Filter out already installed packages
+    local to_install=()
+    for pkg in "${pkgs[@]}"; do
+        if ! dpkg -s "$pkg" &>/dev/null; then
+            to_install+=("$pkg")
+        fi
+    done
+    if (( ${#to_install[@]} == 0 )); then
+        log_info "All system dependencies already installed. Skipping."
+        return 0
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    run_cmd "Install dependencies: ${to_install[*]}" \
+        apt-get install -y "${to_install[@]}"
+    log_info "System dependencies installed."
+}
+# ---- 2: Download & install amdgpu-install script ----------------------------
+step_install_amdgpu_installer() {
+    log_step "Install amdgpu-install package (ROCm 7.2)"
+    # Check if already installed at correct version
+    if dpkg -s amdgpu-install &>/dev/null; then
+        local installed_ver
+        installed_ver="$(dpkg-query -W -f='${Version}' amdgpu-install 2>/dev/null || true)"
+        if [[ "$installed_ver" == *"7.2"* ]] || [[ "$installed_ver" == *"70200"* ]]; then
+            log_info "amdgpu-install 7.2 already installed (version: ${installed_ver}). Skipping."
+            return 0
+        fi
+        log_warn "Different amdgpu-install version found (${installed_ver}). Reinstalling."
+    fi
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    run_cmd "Download amdgpu-install deb" \
+        wget -q -O "${tmp_dir}/${AMDGPU_DEB_FILE}" "$AMDGPU_DEB_URL"
+    export DEBIAN_FRONTEND=noninteractive
+    run_cmd "Install amdgpu-install deb" \
+        apt-get install -y "${tmp_dir}/${AMDGPU_DEB_FILE}"
+    rm -rf "$tmp_dir"
+    log_info "amdgpu-install package installed."
+}
+# ---- 3: Install ROCm via amdgpu-install -------------------------------------
+step_install_rocm() {
+    log_step "Install AMDGPU driver + ROCm stack"
+    # Check if ROCm is already installed and functional
+    if command -v rocminfo &>/dev/null && [[ -f /opt/rocm/.info/version ]]; then
+        local rocm_ver
+        rocm_ver="$(cat /opt/rocm/.info/version 2>/dev/null || true)"
+        if [[ "$rocm_ver" == 7.2* ]]; then
+            log_info "ROCm ${rocm_ver} already installed. Skipping."
+            # Still ensure user groups are set
+            usermod -a -G render,video "$TARGET_USER" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    # Check if DKMS amdgpu module is already built
+    if dkms status 2>/dev/null | grep -q "amdgpu.*installed"; then
+        log_info "AMDGPU DKMS module already installed."
+        # Ensure ROCm userspace is also installed
+        if command -v rocminfo &>/dev/null; then
+            usermod -a -G render,video "$TARGET_USER" 2>/dev/null || true
+            log_info "ROCm userspace present. Skipping full install."
+            return 0
+        fi
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    run_cmd "amdgpu-install --usecase=graphics,rocm" \
+        amdgpu-install -y --usecase=graphics,rocm --accept-eula
+    # Add user to required groups
+    run_cmd "Add ${TARGET_USER} to render,video groups" \
+        usermod -a -G render,video "$TARGET_USER"
+    log_info "ROCm installation complete. Reboot required."
+}
+# ---- 4: Reboot after ROCm install -------------------------------------------
+step_reboot_after_rocm() {
+    log_step "Post-ROCm reboot check"
+    # If AMDGPU kernel module is loaded and rocminfo works, no reboot needed
+    if lsmod | grep -q "^amdgpu " && command -v rocminfo &>/dev/null; then
+        # Try running rocminfo to see if GPU is detected
+        if rocminfo 2>/dev/null | grep -q "gfx1"; then
+            log_info "AMDGPU module loaded and GPU detected. No reboot needed."
+            return 0
+        fi
+    fi
+    # Check if we already rebooted for this step (kernel module should be loaded)
+    if lsmod | grep -q "^amdgpu "; then
+        log_info "AMDGPU module loaded. Proceeding."
+        return 0
+    fi
+    log_info "AMDGPU kernel module not loaded. Reboot required."
+    do_reboot
+}
+# ---- 5: Verify ROCm ---------------------------------------------------------
+step_verify_rocm() {
+    log_step "Verify ROCm installation"
+    # Verify kernel driver
+    if ! dkms status 2>/dev/null | grep -q "amdgpu.*installed"; then
+        log_error "AMDGPU DKMS module not found. ROCm driver installation may have failed."
+        log_error "Try running: sudo amdgpu-install -y --usecase=graphics,rocm"
+        exit 1
+    fi
+    log_info "AMDGPU DKMS module: OK"
+    # Verify rocminfo detects GPU
+    local rocm_output
+    rocm_output="$(rocminfo 2>&1 || true)"
+    if ! echo "$rocm_output" | grep -q "gfx1"; then
+        log_error "rocminfo does not detect any GPU agent."
+        log_error "Output: ${rocm_output}"
+        log_error "Ensure the RX 9070 is properly seated and powered."
+        exit 1
+    fi
+    log_info "rocminfo GPU detection: OK"
+    # Verify ROCm version
+    local rocm_ver
+    rocm_ver="$(cat /opt/rocm/.info/version 2>/dev/null || echo 'unknown')"
+    log_info "ROCm version: ${rocm_ver}"
+    # Verify user groups
+    if ! id -nG "$TARGET_USER" | grep -qw "video"; then
+        log_warn "User ${TARGET_USER} not in video group. Adding."
+        usermod -a -G render,video "$TARGET_USER"
+    fi
+    if ! id -nG "$TARGET_USER" | grep -qw "render"; then
+        log_warn "User ${TARGET_USER} not in render group. Adding."
+        usermod -a -G render,video "$TARGET_USER"
+    fi
+    log_info "User groups: OK"
+    log_info "ROCm verification: PASSED"
+}
+# ---- 6: Create Python virtual environment -----------------------------------
+step_create_venv() {
+    log_step "Create Python virtual environment"
+    if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+        log_info "Virtual environment already exists at ${VENV_DIR}. Skipping."
+        return 0
+    fi
+    run_cmd "Create venv at ${VENV_DIR}" \
+        as_user python3 -m venv "$VENV_DIR"
+    # Upgrade pip and wheel inside venv
+    run_cmd "Upgrade pip and wheel in venv" \
+        as_user "${VENV_DIR}/bin/pip3" install --upgrade pip wheel
+    log_info "Virtual environment created."
+}
+# ---- 7: Download PyTorch wheels ---------------------------------------------
+step_download_wheels() {
+    log_step "Download PyTorch ROCm wheels"
+    mkdir -p "$WHEEL_DIR"
+    chown "$TARGET_USER":"$TARGET_USER" "$WHEEL_DIR"
+    local wheels=(
+        "${WHEEL_BASE}/${TORCH_WHL}|${TORCH_WHL_LOCAL}"
+        "${WHEEL_BASE}/${TORCHVISION_WHL}|${TORCHVISION_WHL_LOCAL}"
+        "${WHEEL_BASE}/${TORCHAUDIO_WHL}|${TORCHAUDIO_WHL_LOCAL}"
+        "${WHEEL_BASE}/${TRITON_WHL}|${TRITON_WHL_LOCAL}"
+    )
+    local all_present=true
+    for entry in "${wheels[@]}"; do
+        local url="${entry%%|*}"
+        local fname="${entry##*|}"
+        local fpath="${WHEEL_DIR}/${fname}"
+        if [[ -f "$fpath" ]] && [[ -s "$fpath" ]]; then
+            log_info "Wheel already downloaded: ${fname}"
+            continue
+        fi
+        all_present=false
+        run_cmd "Download ${fname}" \
+            wget -q --show-progress -O "$fpath" "$url"
+        chown "$TARGET_USER":"$TARGET_USER" "$fpath"
+    done
+    if $all_present; then
+        log_info "All wheels already present. Skipping download."
+    else
+        log_info "Wheel download complete."
+    fi
+}
+# ---- 8: Install PyTorch into venv -------------------------------------------
+step_install_pytorch() {
+    log_step "Install PyTorch ROCm wheels into venv"
+    # Check if torch is already installed with correct version
+    local torch_ver
+    torch_ver="$("${VENV_DIR}/bin/python3" -c "import torch; print(torch.__version__)" 2>/dev/null || true)"
+    if [[ "$torch_ver" == *"rocm7.2"* ]]; then
+        log_info "PyTorch ${torch_ver} already installed. Skipping."
+        return 0
+    fi
+    # Uninstall any existing torch to avoid conflicts
+    as_user "${VENV_DIR}/bin/pip3" uninstall -y torch torchvision torchaudio triton 2>/dev/null || true
+    run_cmd "Install PyTorch ROCm wheels" \
+        as_user "${VENV_DIR}/bin/pip3" install \
+            "${WHEEL_DIR}/${TORCH_WHL_LOCAL}" \
+            "${WHEEL_DIR}/${TORCHVISION_WHL_LOCAL}" \
+            "${WHEEL_DIR}/${TORCHAUDIO_WHL_LOCAL}" \
+            "${WHEEL_DIR}/${TRITON_WHL_LOCAL}"
+    log_info "PyTorch ROCm wheels installed."
+}
+# ---- 9: Verify PyTorch + GPU ------------------------------------------------
+step_verify_pytorch() {
+    log_step "Verify PyTorch ROCm + GPU"
+    local import_ok
+    import_ok="$(as_user "${VENV_DIR}/bin/python3" -c "import torch; print('OK')" 2>&1 || true)"
+    if [[ "$import_ok" != "OK" ]]; then
+        log_error "PyTorch import failed: ${import_ok}"
+        exit 1
+    fi
+    log_info "PyTorch import: OK"
+    local gpu_avail
+    gpu_avail="$(as_user "${VENV_DIR}/bin/python3" -c "import torch; print(torch.cuda.is_available())" 2>&1 || true)"
+    if [[ "$gpu_avail" != "True" ]]; then
+        log_warn "torch.cuda.is_available() returned: ${gpu_avail}"
+        log_warn "This may be because the script is running as root in a systemd service."
+        log_warn "GPU detection will work correctly when run as user ${TARGET_USER}."
+        # Not a fatal error — in systemd context the GPU device permissions
+        # may not apply to the service user. The user session will work.
+    else
+        local dev_name
+        dev_name="$(as_user "${VENV_DIR}/bin/python3" -c \
+            "import torch; print(torch.cuda.get_device_name(0))" 2>&1 || true)"
+        log_info "GPU detected: ${dev_name}"
+    fi
+    local torch_ver
+    torch_ver="$(as_user "${VENV_DIR}/bin/python3" -c "import torch; print(torch.__version__)" 2>&1)"
+    log_info "PyTorch version: ${torch_ver}"
+    log_info "PyTorch verification: PASSED"
+}
+# ---- 10: Clone ComfyUI -------------------------------------------------------
+step_clone_comfyui() {
+    log_step "Clone ComfyUI repository"
+    if [[ -d "${COMFYUI_DIR}/.git" ]]; then
+        log_info "ComfyUI already cloned at ${COMFYUI_DIR}. Skipping."
+        return 0
+    fi
+    # Remove partial clone if present
+    [[ -d "$COMFYUI_DIR" ]] && rm -rf "$COMFYUI_DIR"
+    run_cmd "Clone ComfyUI" \
+        as_user git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_DIR"
+    log_info "ComfyUI cloned."
+}
+# ---- 11: Install ComfyUI Python deps ----------------------------------------
+step_install_comfyui_deps() {
+    log_step "Install ComfyUI Python dependencies"
+    if [[ ! -f "${COMFYUI_DIR}/requirements.txt" ]]; then
+        log_error "ComfyUI requirements.txt not found. Clone may be incomplete."
+        exit 1
+    fi
+    # Check if comfyui deps are already satisfied
+    local already_done
+    already_done="$(as_user "${VENV_DIR}/bin/python3" -c \
+        "import comfy; print('OK')" 2>/dev/null || true)"
+    # Even if the above fails (no "comfy" top-level), we check for a key dep
+    local safetensors_ok
+    safetensors_ok="$(as_user "${VENV_DIR}/bin/python3" -c \
+        "import safetensors; import aiohttp; import einops; print('OK')" 2>/dev/null || true)"
+    if [[ "$safetensors_ok" == "OK" ]]; then
+        log_info "ComfyUI dependencies already satisfied. Skipping."
+        return 0
+    fi
+    run_cmd "Install ComfyUI requirements" \
+        as_user "${VENV_DIR}/bin/pip" install -r "${COMFYUI_DIR}/requirements.txt"
+    log_info "ComfyUI dependencies installed."
+}
+# ---- 12: Download model checkpoint ------------------------------------------
+step_download_model() {
+    log_step "Download SDXL Turbo model"
+    local model_dir="${COMFYUI_DIR}/models/checkpoints"
+    local model_path="${model_dir}/${MODEL_FILE}"
+    mkdir -p "$model_dir"
+    chown -R "$TARGET_USER":"$TARGET_USER" "${COMFYUI_DIR}/models"
+    if [[ -f "$model_path" ]] && [[ -s "$model_path" ]]; then
+        # Basic size check — SDXL Turbo FP16 is ~6.9 GB
+        local size
+        size="$(stat -c%s "$model_path" 2>/dev/null || echo 0)"
+        if (( size > 5000000000 )); then
+            log_info "Model already downloaded (${size} bytes). Skipping."
+            return 0
+        fi
+        log_warn "Model file exists but seems too small (${size} bytes). Re-downloading."
+        rm -f "$model_path"
+    fi
+    run_cmd "Download SDXL Turbo (this may take a while)" \
+        as_user wget -q --show-progress -O "$model_path" "$MODEL_URL"
+    chown "$TARGET_USER":"$TARGET_USER" "$model_path"
+    log_info "Model downloaded: ${MODEL_FILE}"
+}
+# ---- 13: Create launcher script ---------------------------------------------
+step_create_launcher() {
+    log_step "Create ComfyUI launcher script"
+    local launcher="${TARGET_HOME}/launch-comfyui.sh"
+    cat > "$launcher" <<'LAUNCHER'
+#!/usr/bin/env bash
+# ============================================================================
+#  launch-comfyui.sh — Start ComfyUI with AMD ROCm
+#
+#  Usage:  ./launch-comfyui.sh [--lowvram] [other ComfyUI args...]
+#
+#  Open http://127.0.0.1:8188 in your browser after launch.
+# ============================================================================
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="${SCRIPT_DIR}/comfyui-venv"
+COMFYUI_DIR="${SCRIPT_DIR}/ComfyUI"
+if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
+    echo "ERROR: Virtual environment not found at ${VENV_DIR}" >&2
+    exit 1
+fi
+source "${VENV_DIR}/bin/activate"
+cd "$COMFYUI_DIR"
+echo "============================================="
+echo "  ComfyUI — AMD ROCm"
+echo "  Open: http://127.0.0.1:8188"
+echo "  Press Ctrl+C to stop"
+echo "============================================="
+exec python3 main.py "$@"
+LAUNCHER
+    chown "$TARGET_USER":"$TARGET_USER" "$launcher"
+    chmod +x "$launcher"
+    log_info "Launcher script created at: ${launcher}"
+}
+# ---- 14: Final verification --------------------------------------------------
+step_final_verification() {
+    log_step "Final verification"
+    local errors=0
+    # ROCm
+    if ! command -v rocminfo &>/dev/null; then
+        log_error "FINAL CHECK FAIL: rocminfo not found"; (( errors++ ))
+    fi
+    # AMDGPU driver
+    if ! lsmod | grep -q "^amdgpu "; then
+        log_error "FINAL CHECK FAIL: amdgpu kernel module not loaded"; (( errors++ ))
+    fi
+    # PyTorch
+    local torch_ok
+    torch_ok="$(as_user "${VENV_DIR}/bin/python3" -c "import torch; print('OK')" 2>/dev/null || true)"
+    if [[ "$torch_ok" != "OK" ]]; then
+        log_error "FINAL CHECK FAIL: PyTorch import fails"; (( errors++ ))
+    fi
+    # ComfyUI directory
+    if [[ ! -f "${COMFYUI_DIR}/main.py" ]]; then
+        log_error "FINAL CHECK FAIL: ComfyUI main.py not found"; (( errors++ ))
+    fi
+    # Model
+    if [[ ! -s "${COMFYUI_DIR}/models/checkpoints/${MODEL_FILE}" ]]; then
+        log_error "FINAL CHECK FAIL: Model file missing or empty"; (( errors++ ))
+    fi
+    # Launcher
+    if [[ ! -x "${TARGET_HOME}/launch-comfyui.sh" ]]; then
+        log_error "FINAL CHECK FAIL: Launcher script missing"; (( errors++ ))
+    fi
+    if (( errors > 0 )); then
+        log_error "Final verification found ${errors} error(s). Installation incomplete."
+        exit 1
+    fi
+    log_info "============================================================"
+    log_info "  ALL CHECKS PASSED — Installation complete!"
+    log_info "============================================================"
+    log_info ""
+    log_info "  To launch ComfyUI:"
+    log_info "    ${TARGET_HOME}/launch-comfyui.sh"
+    log_info ""
+    log_info "  Then open: http://127.0.0.1:8188"
+    log_info ""
+    log_info "  Log file: ${LOG_FILE}"
+    log_info "============================================================"
+}
+# =============================================================================
+#  SELF-CLEANUP — remove the installer, service, and state
+# =============================================================================
+self_cleanup() {
+    log_step "Self-cleanup"
+    # Remove systemd boot service
+    remove_boot_service
+    # Remove state directory
+    if [[ -d "$STATE_DIR" ]]; then
+        rm -rf "$STATE_DIR"
+        log_info "State directory removed: ${STATE_DIR}"
+    fi
+    # Remove cached wheel files (they are now installed in the venv)
+    if [[ -d "$WHEEL_DIR" ]]; then
+        rm -rf "$WHEEL_DIR"
+        log_info "Cached wheels removed: ${WHEEL_DIR}"
+    fi
+    # Remove lock file
+    release_lock
+    # Remove the amdgpu-install deb if left in /tmp
+    find /tmp -maxdepth 1 -name "amdgpu-install*.deb" -delete 2>/dev/null || true
+    # Remove this script
+    if [[ -f "$SCRIPT_PATH" ]]; then
+        log_info "Removing installer script: ${SCRIPT_PATH}"
+        rm -f "$SCRIPT_PATH"
+    fi
+    log_info "Cleanup complete. System is clean."
+    log_info "Installation log preserved at: ${LOG_FILE}"
+}
+# =============================================================================
+#  MAIN ORCHESTRATOR
+# =============================================================================
+main() {
+    # Ensure running as root
+    if (( EUID != 0 )); then
+        echo "ERROR: This script must be run as root (sudo)." >&2
+        exit 1
+    fi
+    # Ensure target user was identified
+    if [[ -z "$TARGET_USER" ]]; then
+        echo "ERROR: Could not determine target user. Run with: sudo bash $0" >&2
+        exit 1
+    fi
+    # Initialize
+    state_init
+    acquire_lock
+    trap release_lock EXIT
+    # Install boot service so we survive reboots
+    install_boot_service
+    log_info "============================================================"
+    log_info "  ROCm + ComfyUI Automated Installer"
+    log_info "  Target user: ${TARGET_USER}"
+    log_info "  Home:        ${TARGET_HOME}"
+    log_info "  Log:         ${LOG_FILE}"
+    log_info "  State:       ${STATE_FILE}"
+    log_info "============================================================"
+    # Determine where to resume
+    local current_step
+    current_step="$(state_get)"
+    local total_steps="${#STEPS[@]}"
+    log_info "Resuming from step index: ${current_step} / $((total_steps - 1))"
+    # Execute steps
+    for (( i = current_step; i < total_steps; i++ )); do
+        local step_func="${STEPS[$i]}"
+        log_info "--- Executing: ${step_func} (index ${i}) ---"
+        # Call the step function
+        "$step_func"
+        # Persist progress AFTER successful completion
+        state_set "$((i + 1))"
+    done
+    # All steps completed — clean up
+    log_info "All installation steps completed successfully."
+    self_cleanup
+}
+main "$@"
